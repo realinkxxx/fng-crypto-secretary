@@ -1,7 +1,7 @@
 import os
 import json
-import math
 import csv
+import math
 from datetime import datetime, timezone
 
 import requests
@@ -9,21 +9,53 @@ import requests
 STATE_FILE = "secretary_state.json"
 TRADES_FILE = "trades.csv"
 
-BASE_CAPITAL = 10_000.0  # общий виртуальный депозит для BTC+ETH
+BASE_CAPITAL = 10_000.0  # базовый виртуальный депозит
 
 CMC_API_KEY = os.environ.get("CMC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# ---- ПАРАМЕТРЫ СТРАТЕГИИ ----
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+# Целевые суммы покупок по уровням F&G (кратно 50$, суммарно 10 000 $)
+BUY_TARGETS = {
+    40: 1100.0,
+    35: 1500.0,
+    30: 1850.0,
+    25: 1850.0,
+    20: 1850.0,
+    15: 1850.0,
+}
+
+# Порядок уровней для покупок и продаж
+BUY_LEVELS = [40, 35, 30, 25, 20, 15]
+SELL_LEVELS = [60, 65, 70, 75]
+
+# Доли продажи от ЦЕЛЕВОГО пакета на каждый уровень (в сумме ≈ 100%)
+SELL_FRACS = {
+    60: 0.25,
+    65: 0.25,
+    70: 0.25,
+    75: 0.25,
+}
+
+
+# ---- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----
 
 def fmt_usd(x: float) -> str:
     return f"{x:,.2f}".replace(",", " ")
 
 
+def round_down_50(x: float) -> float:
+    """Округление вниз до ближайших 50$."""
+    if x <= 0:
+        return 0.0
+    return math.floor(x / 50.0) * 50.0
+
+
 def load_state():
     if not os.path.exists(STATE_FILE):
+        # начальное состояние
         state = {
             "base_capital": BASE_CAPITAL,
             "cash_usd": BASE_CAPITAL,
@@ -31,25 +63,39 @@ def load_state():
             "eth_amount": 0.0,
             "avg_entry_btc": None,
             "avg_entry_eth": None,
-            # флаги сработавших уровней внутри текущего цикла
-            "buy_used": {
-                "40": False,
-                "35": False,
-                "30": False,
-                "25": False,
-                "20": False,
-                "15": False,
+            # Бакеты по уровням покупок: сколько сейчас "вложено" и сколько BTC/ETH за этим стоит
+            "buckets": {
+                str(lvl): {
+                    "invested_usd": 0.0,
+                    "btc_amount": 0.0,
+                    "eth_amount": 0.0,
+                }
+                for lvl in BUY_LEVELS
             },
-            "sell_used": {
-                "60": False,
-                "65": False,
-                "70": False,
-            },
+            # флажки, чтобы каждый уровень ПРОДАЖИ сработал максимум 1 раз за цикл
+            "sell_used": {str(lvl): False for lvl in SELL_LEVELS},
         }
         save_state(state)
         return state
+
     with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        state = json.load(f)
+
+    # если старый стейт без бакетов — инициализируем
+    if "buckets" not in state:
+        state["buckets"] = {
+            str(lvl): {
+                "invested_usd": 0.0,
+                "btc_amount": 0.0,
+                "eth_amount": 0.0,
+            }
+            for lvl in BUY_LEVELS
+        }
+    # если нет sell_used — добавляем
+    if "sell_used" not in state:
+        state["sell_used"] = {str(lvl): False for lvl in SELL_LEVELS}
+
+    return state
 
 
 def save_state(state):
@@ -57,47 +103,56 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def log_trade(asset, action, fng, price, usd_amount, asset_delta, cash_after, asset_after, avg_entry_price):
-    """
-    asset: 'BTC' или 'ETH'
-    action: 'BUY' или 'SELL'
-    """
+def log_trade(
+    asset: str,
+    action: str,
+    fng: int,
+    price: float,
+    usd_amount: float,
+    asset_delta: float,
+    cash_after: float,
+    asset_after: float,
+    avg_entry_price: float | None,
+):
+    """Логируем сделку в trades.csv"""
     is_new = not os.path.exists(TRADES_FILE)
     with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, delimiter=";")
         if is_new:
-            writer.writerow([
-                "timestamp_utc",
-                "asset",
-                "action",
-                "fng",
-                "price",
-                "usd_amount",
-                "asset_delta",
-                "cash_after",
-                "asset_after",
-                "avg_entry_price"
-            ])
-        writer.writerow([
-            datetime.now(timezone.utc).isoformat(),
-            asset,
-            action,
-            fng,
-            price,
-            usd_amount,
-            asset_delta,
-            cash_after,
-            asset_after,
-            avg_entry_price if avg_entry_price is not None else ""
-        ])
+            writer.writerow(
+                [
+                    "timestamp_utc",
+                    "asset",
+                    "action",
+                    "fng",
+                    "price",
+                    "usd_amount",
+                    "asset_delta",
+                    "cash_after",
+                    "asset_after",
+                    "avg_entry_price",
+                ]
+            )
+        writer.writerow(
+            [
+                datetime.now(timezone.utc).isoformat(),
+                asset,
+                action,
+                fng,
+                price,
+                usd_amount,
+                asset_delta,
+                cash_after,
+                asset_after,
+                avg_entry_price if avg_entry_price is not None else "",
+            ]
+        )
 
 
 def get_fng_cmc():
     """
     Получаем последний индекс страха и жадности от CoinMarketCap.
-    Поддерживаем оба варианта timestamp:
-    - ISO-строка (2025-01-01T00:00:00Z)
-    - Unix time (например, 1763942400)
+    Поддерживаем Unix timestamp и ISO-формат.
     """
     url = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical"
     headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
@@ -109,20 +164,17 @@ def get_fng_cmc():
     value = int(item["value"])
 
     ts_raw = str(item.get("timestamp", ""))
-    # Если это просто число — считаем, что это Unix time
     if ts_raw.isdigit():
         ts = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
     else:
-        # Иначе пробуем как ISO-строку
         ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
 
     return value, ts
 
 
-
 def get_price(symbol: str) -> float:
     """
-    Получаем цену через CoinGecko вместо Binance, чтобы не ловить 451.
+    Цена через CoinGecko (без ключа):
     symbol: "BTCUSDT" или "ETHUSDT"
     """
     if symbol == "BTCUSDT":
@@ -133,15 +185,11 @@ def get_price(symbol: str) -> float:
         raise ValueError(f"Неизвестный тикер для CoinGecko: {symbol}")
 
     url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": coin_id,
-        "vs_currencies": "usd"
-    }
+    params = {"ids": coin_id, "vs_currencies": "usd"}
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
     return float(data[coin_id]["usd"])
-
 
 
 def send_telegram(text: str):
@@ -156,41 +204,40 @@ def send_telegram(text: str):
     return r.json()
 
 
-# ---------- ПАРАМЕТРЫ СТРАТЕГИИ ----------
-
-# лестница покупок: доли от текущего кэша
-BUY_LADDER = {
-    40: 0.10,
-    35: 0.10,
-    30: 0.10,
-    25: 0.20,
-    20: 0.25,
-    15: 0.25,
-}
-
-# лестница продаж: доли от текущей позиции BTC+ETH
-SELL_L60 = 0.30
-SELL_L65 = 0.20
-SELL_L70 = 0.10
-# на 75 продаём всё, что осталось
+def reset_cycle(state):
+    """Полный сброс цикла: когда мы полностью вышли из позиции."""
+    state["buckets"] = {
+        str(lvl): {
+            "invested_usd": 0.0,
+            "btc_amount": 0.0,
+            "eth_amount": 0.0,
+        }
+        for lvl in BUY_LEVELS
+    }
+    state["sell_used"] = {str(lvl): False for lvl in SELL_LEVELS}
+    state["avg_entry_btc"] = None
+    state["avg_entry_eth"] = None
 
 
-def reset_cycle_flags(state):
-    state["buy_used"] = {k: False for k in state["buy_used"].keys()}
-    state["sell_used"] = {k: False for k in state["sell_used"].keys()}
-
+# ---- ОСНОВНАЯ ЛОГИКА ----
 
 def main():
     if not (CMC_API_KEY and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        print("Не заданы переменные окружения: CMC_API_KEY / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        print(
+            "Не заданы переменные окружения: CMC_API_KEY / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID"
+        )
         return
 
     state = load_state()
-    cash = float(state["cash_usd"])
-    btc = float(state["btc_amount"])
-    eth = float(state["eth_amount"])
-    avg_btc = state["avg_entry_btc"]
-    avg_eth = state["avg_entry_eth"]
+
+    cash = float(state.get("cash_usd", BASE_CAPITAL))
+    btc = float(state.get("btc_amount", 0.0))
+    eth = float(state.get("eth_amount", 0.0))
+    avg_btc = state.get("avg_entry_btc")
+    avg_eth = state.get("avg_entry_eth")
+    buckets = state["buckets"]
+    sell_used = state["sell_used"]
+    base = float(state.get("base_capital", BASE_CAPITAL))
 
     try:
         fng, fng_ts = get_fng_cmc()
@@ -200,310 +247,237 @@ def main():
         print("Ошибка при запросе данных:", e)
         return
 
-    base = float(state["base_capital"])
+    actions_text_parts: list[str] = []
 
-    actions_text_parts = []
+    # --- Проверка: если полностью вышли из позиции, сбрасываем цикл ---
+    total_invested = sum(bucket["invested_usd"] for bucket in buckets.values())
+    if total_invested <= 0.0 and btc <= 0.0 and eth <= 0.0:
+        reset_cycle(state)
+        buckets = state["buckets"]
+        sell_used = state["sell_used"]
 
-    # ---------- ПРОДАЖА СНАЧАЛА ----------
+    # ---------- БЛОК ПРОДАЖ ----------
 
-    # полная ликвидация при F&G >= 75
-    if fng >= 75 and (btc > 0 or eth > 0):
-        usd_from_btc = btc * btc_price
-        usd_from_eth = eth * eth_price
-        total_usd = usd_from_btc + usd_from_eth
+    # обрабатываем уровни продаж последовательно: 60 → 65 → 70 → 75
+    for lvl in SELL_LEVELS:
+        lvl_str = str(lvl)
+        if sell_used[lvl_str]:
+            continue  # этот уровень продаж уже отработал в текущем цикле
 
-        cash += total_usd
+        if fng >= lvl:
+            # считаем суммарную продажу по всем бакетам
+            frac = SELL_FRACS[lvl]
+
+            total_sell_btc = 0.0
+            total_sell_eth = 0.0
+            total_sell_usd_btc = 0.0
+            total_sell_usd_eth = 0.0
+
+            for bl in BUY_LEVELS:
+                bl_str = str(bl)
+                bucket = buckets[bl_str]
+                invested = float(bucket["invested_usd"])
+                if invested <= 0:
+                    continue
+
+                # планируемый объём продажи по целевому пакету
+                target = BUY_TARGETS[bl]
+                planned_usd = target * frac
+
+                # округляем вниз до 50$ и ограничиваем текущим остатком
+                sell_usd = min(invested, round_down_50(planned_usd))
+                if sell_usd <= 0:
+                    continue
+
+                # считаем, сколько BTC и ETH "сидит" в бакете по текущей цене
+                bucket_btc = float(bucket["btc_amount"])
+                bucket_eth = float(bucket["eth_amount"])
+
+                btc_value = bucket_btc * btc_price
+                eth_value = bucket_eth * eth_price
+                bucket_value = btc_value + eth_value
+
+                if bucket_value <= 0:
+                    continue
+
+                # делим продаваемую сумму между BTC и ETH пропорционально их текущей стоимости
+                sell_btc_usd = sell_usd * (btc_value / bucket_value)
+                sell_eth_usd = sell_usd * (eth_value / bucket_value)
+
+                sell_btc_amt = sell_btc_usd / btc_price
+                sell_eth_amt = sell_eth_usd / eth_price
+
+                # защита от "сверхпродажи"
+                sell_btc_amt = min(sell_btc_amt, bucket_btc, btc)
+                sell_eth_amt = min(sell_eth_amt, bucket_eth, eth)
+
+                # обновляем глобальные и локальные значения
+                btc -= sell_btc_amt
+                eth -= sell_eth_amt
+                bucket["btc_amount"] -= sell_btc_amt
+                bucket["eth_amount"] -= sell_eth_amt
+                bucket["invested_usd"] -= sell_usd
+                cash += sell_usd
+
+                total_sell_btc += sell_btc_amt
+                total_sell_eth += sell_eth_amt
+                total_sell_usd_btc += sell_btc_usd
+                total_sell_usd_eth += sell_eth_usd
+
+            if total_sell_btc > 0 or total_sell_eth > 0:
+                sell_used[lvl_str] = True
+
+                total_sell_usd = total_sell_usd_btc + total_sell_usd_eth
+                pct_initial = total_sell_usd / base * 100 if base > 0 else 0.0
+
+                actions_text_parts.append(
+                    "📈 <b>Сигнал: ПРОДАЖА BTC и ETH</b>\n"
+                    f"Уровень жадности: <b>{lvl}</b>, текущий F&G: <b>{fng}</b>\n\n"
+                    f"Общий объём продажи: <b>{fmt_usd(total_sell_usd)} $</b> "
+                    f"(≈ {pct_initial:.2f}% от базового портфеля)\n"
+                    f"BTC: продано на ~<b>{fmt_usd(total_sell_usd_btc)} $</b>\n"
+                    f"ETH: продано на ~<b>{fmt_usd(total_sell_usd_eth)} $</b>"
+                )
+
+                # логируем сделку агрегированно по активам
+                if total_sell_btc > 0:
+                    log_trade(
+                        asset="BTC",
+                        action="SELL",
+                        fng=fng,
+                        price=btc_price,
+                        usd_amount=total_sell_usd_btc,
+                        asset_delta=-total_sell_btc,
+                        cash_after=cash,
+                        asset_after=btc,
+                        avg_entry_price=avg_btc,
+                    )
+                if total_sell_eth > 0:
+                    log_trade(
+                        asset="ETH",
+                        action="SELL",
+                        fng=fng,
+                        price=eth_price,
+                        usd_amount=total_sell_usd_eth,
+                        asset_delta=-total_sell_eth,
+                        cash_after=cash,
+                        asset_after=eth,
+                        avg_entry_price=avg_eth,
+                    )
+
+    # после продаж проверяем, не вышли ли полностью
+    total_invested = sum(bucket["invested_usd"] for bucket in buckets.values())
+    if total_invested <= 0 and btc <= 0 and eth <= 0:
+        cash = base  # виртуально считаем, что полностью вернулись в кэш
+        reset_cycle(state)
+        buckets = state["buckets"]
+        sell_used = state["sell_used"]
         btc = 0.0
         eth = 0.0
         avg_btc = None
         avg_eth = None
 
-        reset_cycle_flags(state)
+    # ---------- БЛОК ПОКУПОК ----------
 
-        pct_initial = total_usd / base * 100 if base > 0 else 0.0
+    # если F&G достаточно низкий — "подтягиваем" каждый пакет к целевому уровню
+    for lvl in BUY_LEVELS:
+        if fng <= lvl:
+            lvl_str = str(lvl)
+            bucket = buckets[lvl_str]
+            target = BUY_TARGETS[lvl]
+            invested = float(bucket["invested_usd"])
 
-        actions_text_parts.append(
-            "📈 <b>Сигнал: ПОЛНАЯ ПРОДАЖА BTC и ETH (уровень 75)</b>\n"
-            f"Индекс страха и жадности: <b>{fng}</b>\n\n"
-            f"Объём сделки: <b>{fmt_usd(total_usd)} $</b> "
-            f"(≈ {pct_initial:.2f}% от базового портфеля)\n"
-            f"BTC: продано на ~<b>{fmt_usd(usd_from_btc)} $</b>\n"
-            f"ETH: продано на ~<b>{fmt_usd(usd_from_eth)} $</b>"
-        )
+            need_usd = target - invested
+            if need_usd <= 0:
+                continue
 
-        # логируем сделки отдельно по BTC и ETH
-        log_trade(
-            asset="BTC",
-            action="SELL",
-            fng=fng,
-            price=btc_price,
-            usd_amount=usd_from_btc,
-            asset_delta=-btc,   # но btc уже 0, поэтому логируем через исходное значение:
-            cash_after=cash,
-            asset_after=0.0,
-            avg_entry_price=avg_btc,
-        )
-        log_trade(
-            asset="ETH",
-            action="SELL",
-            fng=fng,
-            price=eth_price,
-            usd_amount=usd_from_eth,
-            asset_delta=-eth,
-            cash_after=cash,
-            asset_after=0.0,
-            avg_entry_price=avg_eth,
-        )
+            # не тратим больше, чем есть кэша
+            need_usd = min(need_usd, cash)
+            buy_usd = round_down_50(need_usd)
 
-    else:
-        # частичные продажи на 70, 65, 60 (в таком порядке, сверху вниз)
-        total_portfolio_usd_before = btc * btc_price + eth * eth_price + cash
-
-        # 70: 10% позиции
-        if 70 <= fng < 75 and (btc > 0 or eth > 0) and not state["sell_used"]["70"]:
-            frac = SELL_L70
-            sell_btc = btc * frac
-            sell_eth = eth * frac
-            usd_from_btc = sell_btc * btc_price
-            usd_from_eth = sell_eth * eth_price
-            total_usd = usd_from_btc + usd_from_eth
-
-            btc -= sell_btc
-            eth -= sell_eth
-            cash += total_usd
-
-            state["sell_used"]["70"] = True
-
-            pct_initial = total_usd / base * 100 if base > 0 else 0.0
-            pct_pos = frac * 100
-
-            actions_text_parts.append(
-                "📈 <b>Сигнал: ПРОДАЖА BTC и ETH (уровень 70)</b>\n"
-                f"Индекс страха и жадности: <b>{fng}</b>\n\n"
-                f"Объём сделки: <b>{fmt_usd(total_usd)} $</b> "
-                f"(≈ {pct_initial:.2f}% от базового портфеля, {pct_pos:.2f}% от текущей позиции)\n"
-                f"BTC: продано на ~<b>{fmt_usd(usd_from_btc)} $</b>\n"
-                f"ETH: продано на ~<b>{fmt_usd(usd_from_eth)} $</b>"
-            )
-
-            log_trade(
-                asset="BTC",
-                action="SELL",
-                fng=fng,
-                price=btc_price,
-                usd_amount=usd_from_btc,
-                asset_delta=-sell_btc,
-                cash_after=cash,
-                asset_after=btc,
-                avg_entry_price=avg_btc,
-            )
-            log_trade(
-                asset="ETH",
-                action="SELL",
-                fng=fng,
-                price=eth_price,
-                usd_amount=usd_from_eth,
-                asset_delta=-sell_eth,
-                cash_after=cash,
-                asset_after=eth,
-                avg_entry_price=avg_eth,
-            )
-
-        # 65: 20% позиции
-        if 65 <= fng < 70 and (btc > 0 or eth > 0) and not state["sell_used"]["65"]:
-            frac = SELL_L65
-            sell_btc = btc * frac
-            sell_eth = eth * frac
-            usd_from_btc = sell_btc * btc_price
-            usd_from_eth = sell_eth * eth_price
-            total_usd = usd_from_btc + usd_from_eth
-
-            btc -= sell_btc
-            eth -= sell_eth
-            cash += total_usd
-
-            state["sell_used"]["65"] = True
-
-            pct_initial = total_usd / base * 100 if base > 0 else 0.0
-            pct_pos = frac * 100
-
-            actions_text_parts.append(
-                "📈 <b>Сигнал: ПРОДАЖА BTC и ETH (уровень 65)</b>\n"
-                f"Индекс страха и жадности: <b>{fng}</b>\n\n"
-                f"Объём сделки: <b>{fmt_usd(total_usd)} $</b> "
-                f"(≈ {pct_initial:.2f}% от базового портфеля, {pct_pos:.2f}% от текущей позиции)\n"
-                f"BTC: продано на ~<b>{fmt_usd(usd_from_btc)} $</b>\n"
-                f"ETH: продано на ~<b>{fmt_usd(usd_from_eth)} $</b>"
-            )
-
-            log_trade(
-                asset="BTC",
-                action="SELL",
-                fng=fng,
-                price=btc_price,
-                usd_amount=usd_from_btc,
-                asset_delta=-sell_btc,
-                cash_after=cash,
-                asset_after=btc,
-                avg_entry_price=avg_btc,
-            )
-            log_trade(
-                asset="ETH",
-                action="SELL",
-                fng=fng,
-                price=eth_price,
-                usd_amount=usd_from_eth,
-                asset_delta=-sell_eth,
-                cash_after=cash,
-                asset_after=eth,
-                avg_entry_price=avg_eth,
-            )
-
-        # 60: 30% позиции
-        if 60 <= fng < 65 and (btc > 0 or eth > 0) and not state["sell_used"]["60"]:
-            frac = SELL_L60
-            sell_btc = btc * frac
-            sell_eth = eth * frac
-            usd_from_btc = sell_btc * btc_price
-            usd_from_eth = sell_eth * eth_price
-            total_usd = usd_from_btc + usd_from_eth
-
-            btc -= sell_btc
-            eth -= sell_eth
-            cash += total_usd
-
-            state["sell_used"]["60"] = True
-
-            pct_initial = total_usd / base * 100 if base > 0 else 0.0
-            pct_pos = frac * 100
-
-            actions_text_parts.append(
-                "📈 <b>Сигнал: ПРОДАЖА BTC и ETH (уровень 60)</b>\n"
-                f"Индекс страха и жадности: <b>{fng}</b>\n\n"
-                f"Объём сделки: <b>{fmt_usd(total_usd)} $</b> "
-                f"(≈ {pct_initial:.2f}% от базового портфеля, {pct_pos:.2f}% от текущей позиции)\n"
-                f"BTC: продано на ~<b>{fmt_usd(usd_from_btc)} $</b>\n"
-                f"ETH: продано на ~<b>{fmt_usd(usd_from_eth)} $</b>"
-            )
-
-            log_trade(
-                asset="BTC",
-                action="SELL",
-                fng=fng,
-                price=btc_price,
-                usd_amount=usd_from_btc,
-                asset_delta=-sell_btc,
-                cash_after=cash,
-                asset_after=btc,
-                avg_entry_price=avg_btc,
-            )
-            log_trade(
-                asset="ETH",
-                action="SELL",
-                fng=fng,
-                price=eth_price,
-                usd_amount=usd_from_eth,
-                asset_delta=-sell_eth,
-                cash_after=cash,
-                asset_after=eth,
-                avg_entry_price=avg_eth,
-            )
-
-    # если вышли полностью → сбросить цикл
-    if btc <= 0 and eth <= 0:
-        btc = 0.0
-        eth = 0.0
-        avg_btc = None
-        avg_eth = None
-        reset_cycle_flags(state)
-
-    # ---------- ПОКУПКИ ПО ЛЕСТНИЦЕ ----------
-
-    # Проверяем уровни 40,35,30,25,20,15 по порядку (от меньшей агрессии к большей)
-    # В один запуск могут сработать сразу несколько уровней, если F&G низкий.
-    buy_order = [40, 35, 30, 25, 20, 15]
-
-    for level in buy_order:
-        frac = BUY_LADDER[level]
-        key = str(level)
-        if not state["buy_used"][key] and fng <= level and cash > 0 and frac > 0:
-            spend = cash * frac
-            if spend <= 0:
+            if buy_usd <= 0:
                 continue
 
             # половина в BTC, половина в ETH
-            usd_btc = spend / 2.0
-            usd_eth = spend / 2.0
+            usd_btc = buy_usd / 2.0
+            usd_eth = buy_usd / 2.0
 
-            buy_btc = usd_btc / btc_price
-            buy_eth = usd_eth / eth_price
+            buy_btc_amount = usd_btc / btc_price
+            buy_eth_amount = usd_eth / eth_price
 
-            # обновляем среднюю цену
-            if buy_btc > 0:
+            # обновляем среднюю цену входа
+            if buy_btc_amount > 0:
                 if btc <= 0:
                     avg_btc = btc_price
                 else:
                     total_cost_btc = avg_btc * btc + usd_btc
-                    btc_new = btc + buy_btc
+                    btc_new = btc + buy_btc_amount
                     avg_btc = total_cost_btc / btc_new
-            if buy_eth > 0:
+            if buy_eth_amount > 0:
                 if eth <= 0:
                     avg_eth = eth_price
                 else:
                     total_cost_eth = avg_eth * eth + usd_eth
-                    eth_new = eth + buy_eth
+                    eth_new = eth + buy_eth_amount
                     avg_eth = total_cost_eth / eth_new
 
-            btc += buy_btc
-            eth += buy_eth
-            cash -= spend
+            # обновляем портфель и бакет
+            btc += buy_btc_amount
+            eth += buy_eth_amount
+            bucket["btc_amount"] += buy_btc_amount
+            bucket["eth_amount"] += buy_eth_amount
+            bucket["invested_usd"] += buy_usd
+            cash -= buy_usd
 
-            state["buy_used"][key] = True
-
-            pct_initial = spend / base * 100 if base > 0 else 0.0
-            pct_cash = frac * 100
+            pct_initial = buy_usd / base * 100 if base > 0 else 0.0
 
             actions_text_parts.append(
                 "📉 <b>Сигнал: ПОКУПКА BTC и ETH</b>\n"
-                f"Уровень индекса: <b>{level}</b>, текущий F&G: <b>{fng}</b>\n\n"
-                f"Общий объём покупки: <b>{fmt_usd(spend)} $</b> "
-                f"(≈ {pct_initial:.2f}% от базового портфеля, {pct_cash:.2f}% от текущего кэша)\n"
+                f"Уровень индекса: <b>{lvl}</b>, текущий F&G: <b>{fng}</b>\n\n"
+                f"Общий объём покупки: <b>{fmt_usd(buy_usd)} $</b> "
+                f"(≈ {pct_initial:.2f}% от базового портфеля)\n"
                 f"BTC: покупка на ~<b>{fmt_usd(usd_btc)} $</b>\n"
                 f"ETH: покупка на ~<b>{fmt_usd(usd_eth)} $</b>"
             )
 
-            log_trade(
-                asset="BTC",
-                action="BUY",
-                fng=fng,
-                price=btc_price,
-                usd_amount=usd_btc,
-                asset_delta=buy_btc,
-                cash_after=cash,
-                asset_after=btc,
-                avg_entry_price=avg_btc,
-            )
-            log_trade(
-                asset="ETH",
-                action="BUY",
-                fng=fng,
-                price=eth_price,
-                usd_amount=usd_eth,
-                asset_delta=buy_eth,
-                cash_after=cash,
-                asset_after=eth,
-                avg_entry_price=avg_eth,
-            )
+            # логируем покупку агрегированно по активам
+            if buy_btc_amount > 0:
+                log_trade(
+                    asset="BTC",
+                    action="BUY",
+                    fng=fng,
+                    price=btc_price,
+                    usd_amount=usd_btc,
+                    asset_delta=buy_btc_amount,
+                    cash_after=cash,
+                    asset_after=btc,
+                    avg_entry_price=avg_btc,
+                )
+            if buy_eth_amount > 0:
+                log_trade(
+                    asset="ETH",
+                    action="BUY",
+                    fng=fng,
+                    price=eth_price,
+                    usd_amount=usd_eth,
+                    asset_delta=buy_eth_amount,
+                    cash_after=cash,
+                    asset_after=eth,
+                    avg_entry_price=avg_eth,
+                )
 
-    # если нет ни одной покупки/продажи — ничего не шлём
+    # ---------- ИТОГ И ОТПРАВКА В TELEGRAM ----------
+
+    # если в этом прогоне не было ни покупок, ни продаж — молчим
     if not actions_text_parts:
         print(f"Сигналов нет. F&G={fng}, BTC={btc_price}, ETH={eth_price}")
-        # просто сохраняем состояние
         state["cash_usd"] = cash
         state["btc_amount"] = btc
         state["eth_amount"] = eth
         state["avg_entry_btc"] = avg_btc
         state["avg_entry_eth"] = avg_eth
+        state["buckets"] = buckets
+        state["sell_used"] = sell_used
         save_state(state)
         return
 
@@ -513,6 +487,8 @@ def main():
     state["eth_amount"] = eth
     state["avg_entry_btc"] = avg_btc
     state["avg_entry_eth"] = avg_eth
+    state["buckets"] = buckets
+    state["sell_used"] = sell_used
     save_state(state)
 
     total_value = cash + btc * btc_price + eth * eth_price
@@ -525,9 +501,13 @@ def main():
         f"ETH: <b>{eth:.6f}</b> (~<b>{fmt_usd(eth * eth_price)} $</b>)\n"
         f"Итого: <b>{fmt_usd(total_value)} $</b> "
         f"({port_change_pct:+.2f}% к базовому 10 000 $)\n"
-        f"Средняя цена входа BTC: <b>{fmt_usd(avg_btc) + ' USDT' if avg_btc else '—'}</b>\n"
-        f"Средняя цена входа ETH: <b>{fmt_usd(avg_eth) + ' USDT' if avg_eth else '—'}</b>"
+        f"Средняя цена входа BTC: <b>{fmt_usd(avg_btc)} USDT</b>" if avg_btc else "\nСредняя цена входа BTC: —"
     )
+
+    if avg_eth:
+        summary += f"\nСредняя цена входа ETH: <b>{fmt_usd(avg_eth)} USDT</b>"
+    else:
+        summary += "\nСредняя цена входа ETH: —"
 
     text = "\n\n".join(actions_text_parts) + summary
 
