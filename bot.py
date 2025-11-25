@@ -121,11 +121,27 @@ def get_fng_cmc():
 
 
 def get_price(symbol: str) -> float:
-    url = "https://api.binance.com/api/v3/ticker/price"
-    params = {"symbol": symbol}
-    r = requests.get(url, params=params, timeout=10)
+    """
+    Получаем цену через CoinGecko вместо Binance, чтобы не ловить 451.
+    symbol: "BTCUSDT" или "ETHUSDT"
+    """
+    if symbol == "BTCUSDT":
+        coin_id = "bitcoin"
+    elif symbol == "ETHUSDT":
+        coin_id = "ethereum"
+    else:
+        raise ValueError(f"Неизвестный тикер для CoinGecko: {symbol}")
+
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": coin_id,
+        "vs_currencies": "usd"
+    }
+    r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
-    return float(r.json()["price"])
+    data = r.json()
+    return float(data[coin_id]["usd"])
+
 
 
 def send_telegram(text: str):
