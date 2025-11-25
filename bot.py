@@ -95,6 +95,9 @@ def log_trade(asset, action, fng, price, usd_amount, asset_delta, cash_after, as
 def get_fng_cmc():
     """
     Получаем последний индекс страха и жадности от CoinMarketCap.
+    Поддерживаем оба варианта timestamp:
+    - ISO-строка (2025-01-01T00:00:00Z)
+    - Unix time (например, 1763942400)
     """
     url = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical"
     headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
@@ -104,8 +107,17 @@ def get_fng_cmc():
     data = r.json()
     item = data["data"][0]
     value = int(item["value"])
-    ts = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00"))
+
+    ts_raw = str(item.get("timestamp", ""))
+    # Если это просто число — считаем, что это Unix time
+    if ts_raw.isdigit():
+        ts = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
+    else:
+        # Иначе пробуем как ISO-строку
+        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+
     return value, ts
+
 
 
 def get_price(symbol: str) -> float:
