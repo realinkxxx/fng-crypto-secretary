@@ -2,8 +2,7 @@ name: FNG Secretary Bot
 
 on:
   schedule:
-    # каждые 4 часа
-    - cron: "0 */4 * * *"
+    - cron: "0 */4 * * *"   # каждые 4 часа
   workflow_dispatch: {}
 
 jobs:
@@ -33,11 +32,19 @@ jobs:
 
       - name: Commit state if changed
         run: |
-          if ! git diff --quiet; then
+          if [ -n "$(git status --porcelain)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            # добавляем только файлы состояния/логов
-            git add secretary_state.json trades.csv || true
-            git commit -m "Update state $(date -u +"%Y-%m-%dT%H:%M:%SZ")" || true
-            git push || true
+
+            if [ -f secretary_state.json ]; then
+              git add secretary_state.json
+            fi
+            if [ -f trades.csv ]; then
+              git add trades.csv
+            fi
+
+            if [ -n "$(git status --porcelain)" ]; then
+              git commit -m "Update state $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+              git push
+            fi
           fi
