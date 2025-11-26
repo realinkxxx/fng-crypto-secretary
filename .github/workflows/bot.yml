@@ -28,23 +28,38 @@ jobs:
           CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python bot.py
-
-      - name: Commit state if changed
         run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
+          python bot.py
+          echo "==== FILES AFTER BOT RUN ===="
+          ls -la
 
-            if [ -f secretary_state.json ]; then
-              git add secretary_state.json
-            fi
-            if [ -f trades.csv ]; then
-              git add trades.csv
-            fi
+      - name: Commit state if exists
+        run: |
+          echo "==== FILES BEFORE COMMIT STEP ===="
+          ls -la
 
-            if [ -n "$(git status --porcelain)" ]; then
-              git commit -m "Update state $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-              git push
-            fi
+          # Если нет ни одного файла состояния - просто выходим
+          if [ ! -f secretary_state.json ] && [ ! -f trades.csv ]; then
+            echo "No state files (secretary_state.json / trades.csv) to commit."
+            exit 0
           fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Добавляем, только если файлы существуют
+          if [ -f secretary_state.json ]; then
+            git add secretary_state.json
+          fi
+          if [ -f trades.csv ]; then
+            git add trades.csv
+          fi
+
+          # Если после add нет изменений — выходим
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update state $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          git push
